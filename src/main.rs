@@ -1,7 +1,10 @@
+mod accounts;
 mod auth;
 mod config;
 mod draft;
 mod mail;
+mod oauth;
+mod web;
 
 use std::io::{IsTerminal, Read, Write};
 use std::path::PathBuf;
@@ -11,7 +14,7 @@ use clap::{Args, Parser, Subcommand};
 use imap::types::Flag;
 use serde::Serialize;
 
-use config::{Account, AuthMethod, Config, Provider};
+use config::{Config, Provider};
 use draft::Draft;
 use mail::{Client, Summary};
 
@@ -37,7 +40,7 @@ struct Cli {
 enum Cmd {
     /// Manage configured accounts.
     #[command(subcommand)]
-    Account(AccountCmd),
+    Account(accounts::AccountCmd),
     /// List mailboxes (folders/labels) and their special-use roles.
     Mailboxes,
     /// List the most recent messages in a mailbox.
@@ -73,45 +76,6 @@ enum Cmd {
     /// Create, edit and manage drafts (synced to the server's Drafts mailbox).
     #[command(subcommand)]
     Draft(DraftCmd),
-}
-
-#[derive(Subcommand)]
-enum AccountCmd {
-    /// Add an account. Prompts for the app password and stores it in the OS keychain.
-    Add {
-        name: String,
-        #[arg(long, value_enum)]
-        provider: Provider,
-        #[arg(long)]
-        email: String,
-        /// Display name for the From header.
-        #[arg(long)]
-        display_name: Option<String>,
-        /// IMAP username if different from the email address.
-        #[arg(long)]
-        username: Option<String>,
-        /// Read the password from stdin instead of prompting.
-        #[arg(long)]
-        password_stdin: bool,
-        /// Don't store a password; get it from this shell command instead.
-        #[arg(long)]
-        password_command: Option<String>,
-        /// Use XOAUTH2 with a token from this shell command (Gmail).
-        #[arg(long, conflicts_with_all = ["password_stdin", "password_command"])]
-        oauth_token_command: Option<String>,
-        /// Make this the default account.
-        #[arg(long)]
-        default: bool,
-        /// Skip the test login.
-        #[arg(long)]
-        no_verify: bool,
-    },
-    /// List configured accounts.
-    List,
-    /// Remove an account and its stored password.
-    Remove { name: String },
-    /// Set the default account.
-    Default { name: String },
 }
 
 #[derive(Args, Default)]
@@ -274,11 +238,11 @@ fn run() -> Result<()> {
     let mut cfg = Config::load()?;
 
     if let Cmd::Account(cmd) = &cli.cmd {
-        return account_cmd(cmd, &mut cfg, cli.json);
+        return accounts::run(cmd, &mut cfg, cli.json);
     }
 
     let (name, account) = cfg.account(cli.account.as_deref())?;
-    let mut c = Client::connect(&name, &account)?;
+    let mut c = Client::connect(&name, &account, cfg.google_client().as_ref())?;
     let res = dispatch(&cli, &mut c);
     c.logout();
     res
@@ -726,120 +690,4 @@ fn raw_has_uuid(raw: &[u8]) -> bool {
     mail_parser::MessageParser::default()
         .parse_headers(raw)
         .is_some_and(|m| m.header_raw(draft::UUID_HEADER).is_some())
-}
-
-// ---------------------------------------------------------------- accounts
-
-fn account_cmd(cmd: &AccountCmd, cfg: &mut Config, json: bool) -> Result<()> {
-    match cmd {
-        AccountCmd::Add {
-            name,
-            provider,
-            email,
-            display_name,
-            username,
-            password_stdin,
-            password_command,
-            oauth_token_command,
-            default,
-            no_verify,
-        } => {
-            if *provider == Provider::Icloud && oauth_token_command.is_some() {
-                bail!("iCloud does not support OAuth for IMAP; use an app-specific password");
-            }
-            let acct = Account {
-                provider: *provider,
-                email: email.clone(),
-                name: display_name.clone(),
-                username: username.clone(),
-                host: None,
-                port: None,
-                auth: if oauth_token_command.is_some() {
-                    AuthMethod::Oauth2
-                } else {
-                    AuthMethod::Password
-                },
-                password_command: password_command.clone(),
-                oauth_token_command: oauth_token_command.clone(),
-                drafts_mailbox: None,
-                trash_mailbox: None,
-                insecure_plaintext: false,
-            };
-            if acct.auth == AuthMethod::Password && acct.password_command.is_none() {
-                let pw = if *password_stdin {
-                    let mut s = String::new();
-                    std::io::stdin().read_line(&mut s)?;
-                    s
-                } else {
-                    let what = match provider {
-                        Provider::Gmail => "Gmail app password",
-                        Provider::Icloud => "iCloud app-specific password",
-                    };
-                    rpassword::prompt_password(format!("{what} for {email}: "))?
-                };
-                if pw.trim().is_empty() {
-                    bail!("empty password");
-                }
-                auth::store_password(&acct, pw.trim())?;
-            }
-            if !no_verify {
-                let mut c = Client::connect(name, &acct)?;
-                let drafts = c.drafts_mailbox()?;
-                c.logout();
-                if !json {
-                    println!("Logged in OK; drafts mailbox is `{drafts}`");
-                }
-            }
-            cfg.accounts.insert(name.clone(), acct);
-            if *default || cfg.default_account.is_none() {
-                cfg.default_account = Some(name.clone());
-            }
-            cfg.save()?;
-            if json {
-                print_json(&serde_json::json!({ "added": name }))?;
-            } else {
-                println!(
-                    "Added account `{name}` ({})",
-                    config::config_path().display()
-                );
-            }
-        }
-        AccountCmd::List => {
-            if json {
-                return print_json(&cfg.accounts);
-            }
-            if cfg.accounts.is_empty() {
-                println!("(no accounts; run `agent-mail account add`)");
-            }
-            for (n, a) in &cfg.accounts {
-                let star = if cfg.default_account.as_deref() == Some(n) {
-                    "*"
-                } else {
-                    " "
-                };
-                println!("{star} {n:15} {:7} {}", a.provider.to_string(), a.email);
-            }
-        }
-        AccountCmd::Remove { name } => {
-            let acct = cfg
-                .accounts
-                .remove(name)
-                .ok_or_else(|| anyhow!("unknown account `{name}`"))?;
-            auth::delete_password(&acct)?;
-            if cfg.default_account.as_deref() == Some(name) {
-                cfg.default_account = cfg.accounts.keys().next().cloned();
-            }
-            cfg.save()?;
-            println!("Removed account `{name}`");
-        }
-        AccountCmd::Default { name } => {
-            if !cfg.accounts.contains_key(name) {
-                bail!("unknown account `{name}`");
-            }
-            cfg.default_account = Some(name.clone());
-            cfg.save()?;
-            println!("Default account is now `{name}`");
-        }
-    }
-    Ok(())
 }

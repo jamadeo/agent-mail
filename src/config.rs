@@ -51,7 +51,8 @@ pub enum AuthMethod {
     /// LOGIN with an app password (Gmail app password / iCloud app-specific password).
     #[default]
     Password,
-    /// SASL XOAUTH2 with an access token printed by `oauth_token_command` (Gmail only).
+    /// SASL XOAUTH2 (Gmail only). Tokens come from the browser sign-in flow
+    /// (`account login`), or from `oauth_token_command` if set.
     Oauth2,
 }
 
@@ -99,10 +100,21 @@ impl Account {
     }
 }
 
+/// A Google Cloud OAuth client of type "Desktop app".
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OAuthClient {
+    pub client_id: String,
+    /// Not actually confidential for desktop clients (Google's docs say so),
+    /// but required by the token endpoint.
+    pub client_secret: String,
+}
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_account: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub google_oauth: Option<OAuthClient>,
     #[serde(default)]
     pub accounts: BTreeMap<String, Account>,
 }
@@ -135,7 +147,27 @@ impl Config {
             std::fs::create_dir_all(dir)?;
         }
         std::fs::write(&path, toml::to_string_pretty(self)?)
-            .with_context(|| format!("writing {}", path.display()))
+            .with_context(|| format!("writing {}", path.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+        }
+        Ok(())
+    }
+
+    /// Google OAuth client: env vars override the config file.
+    pub fn google_client(&self) -> Option<OAuthClient> {
+        match (
+            std::env::var("AGENT_MAIL_GOOGLE_CLIENT_ID"),
+            std::env::var("AGENT_MAIL_GOOGLE_CLIENT_SECRET"),
+        ) {
+            (Ok(client_id), Ok(client_secret)) => Some(OAuthClient {
+                client_id,
+                client_secret,
+            }),
+            _ => self.google_oauth.clone(),
+        }
     }
 
     /// Resolve which account to use: explicit name, else default, else the only one.

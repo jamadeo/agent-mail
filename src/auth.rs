@@ -2,7 +2,7 @@ use std::process::Command;
 
 use anyhow::{Context, Result, bail};
 
-use crate::config::Account;
+use crate::config::{Account, OAuthClient};
 
 const KEYRING_SERVICE: &str = "agent-mail";
 
@@ -60,11 +60,43 @@ pub fn password(account_name: &str, account: &Account) -> Result<String> {
     }
 }
 
-pub fn oauth_token(account: &Account) -> Result<String> {
-    match &account.oauth_token_command {
-        Some(cmd) => run_secret_command(cmd),
-        None => bail!("auth = \"oauth2\" requires oauth_token_command in the account config"),
+/// Access token for XOAUTH2: `oauth_token_command` if configured, else the
+/// built-in Google flow using the refresh token stored by `account login`.
+pub fn oauth_token(
+    account_name: &str,
+    account: &Account,
+    google: Option<&OAuthClient>,
+) -> Result<String> {
+    if let Some(cmd) = &account.oauth_token_command {
+        return run_secret_command(cmd);
     }
+    let Some(client) = google else {
+        bail!(
+            "no Google OAuth client configured; run `agent-mail account login {account_name}` \
+             or set AGENT_MAIL_GOOGLE_CLIENT_ID / AGENT_MAIL_GOOGLE_CLIENT_SECRET"
+        );
+    };
+    crate::oauth::access_token(client, account_name, account)
+}
+
+fn refresh_entry(account: &Account) -> Result<keyring::Entry> {
+    Ok(keyring::Entry::new(
+        KEYRING_SERVICE,
+        &format!("{}#google-refresh-token", account.email),
+    )?)
+}
+
+pub fn refresh_token(account: &Account) -> Result<Option<String>> {
+    match refresh_entry(account)?.get_password() {
+        Ok(t) => Ok(Some(t)),
+        Err(keyring::Error::NoEntry) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+pub fn store_refresh_token(account: &Account, token: &str) -> Result<()> {
+    refresh_entry(account)?.set_password(token)?;
+    Ok(())
 }
 
 pub fn store_password(account: &Account, pw: &str) -> Result<()> {
@@ -74,8 +106,14 @@ pub fn store_password(account: &Account, pw: &str) -> Result<()> {
 }
 
 pub fn delete_password(account: &Account) -> Result<()> {
-    match keyring::Entry::new(KEYRING_SERVICE, &account.email)?.delete_credential() {
-        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
-        Err(e) => Err(e.into()),
+    for entry in [
+        keyring::Entry::new(KEYRING_SERVICE, &account.email)?,
+        refresh_entry(account)?,
+    ] {
+        match entry.delete_credential() {
+            Ok(()) | Err(keyring::Error::NoEntry) => {}
+            Err(e) => return Err(e.into()),
+        }
     }
+    Ok(())
 }

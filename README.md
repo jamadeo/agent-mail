@@ -17,35 +17,88 @@ cargo install --path .
 
 ## Setup
 
-Both providers need an app password. Your normal account password won't work over IMAP.
-
-- **Gmail:** turn on 2-Step Verification, then create a password at
-  <https://myaccount.google.com/apppasswords>. Also check that IMAP is on in
-  Gmail Settings → Forwarding and POP/IMAP.
-- **iCloud:** create an app-specific password at <https://account.apple.com> →
-  Sign-In and Security → App-Specific Passwords.
+Run this and answer the prompts:
 
 ```sh
-agent-mail account add personal --provider gmail  --email you@gmail.com  --display-name "You"
-agent-mail account add apple    --provider icloud --email you@icloud.com --display-name "You"
-agent-mail account default personal
+agent-mail account add
 ```
 
-`account add` prompts for the password, saves it in the macOS Keychain (service
-`agent-mail`), test-logs in, and finds your Drafts mailbox.
+It asks for your email address, works out the provider from the domain (or asks), and
+then signs you in:
 
-The tool looks for a password in this order:
+- **Gmail** opens a Google sign-in page in your browser. After you approve access, the
+  browser sends you back to a temporary local web server, and the tool stores the
+  resulting refresh token in the macOS Keychain. No password is involved.
+- **iCloud** has no browser sign-in for mail; Apple only accepts app-specific
+  passwords. The tool opens Apple's page for creating one and asks you to paste it.
 
-1. The `AGENT_MAIL_<ACCOUNT>_PASSWORD` environment variable.
-2. `password_command` in the config, for example `op read op://Private/gmail/app-pw`.
-3. The OS keychain.
+When the token expires or is revoked, run `agent-mail account login <name>` to sign in again.
 
-Gmail Workspace accounts that block app passwords can use XOAUTH2 instead:
-`--oauth-token-command "<command that prints an access token>"`.
+Every login is checked against the server **before** anything is saved, so a mistyped
+password never replaces a working one.
 
-The config lives in `~/.config/agent-mail/config.toml`. You can point to a different
-file with `AGENT_MAIL_CONFIG`. Each account can override `host`, `port`, `username`,
-`drafts_mailbox` and `trash_mailbox`.
+### Adding accounts in a web form
+
+```sh
+agent-mail account add --web
+```
+
+This opens a form in your browser with the same inputs as the command line: email,
+provider, account name, display name, IMAP username, and the sign-in method (app
+password, Google sign-in, password command, or token command). Any flags you pass,
+such as `--email`, pre-fill the form. Wrong passwords or other errors show up on the
+form so you can fix them. After an account is added you can add another one, or click
+**Done** to shut the form down. Add `--no-browser` to print the URL instead of opening
+it.
+
+The form is served only to this computer (127.0.0.1) on a random port. Its URL
+contains a secret token, and the server rejects requests that come from other websites.
+
+### One-time Google setup (Gmail browser sign-in)
+
+Google only allows browser sign-in through an OAuth client registered to you. Creating
+one takes about five minutes and is free:
+
+1. In <https://console.cloud.google.com>, create a project and enable the **Gmail API**.
+2. Set up the **OAuth consent screen**: choose External and add your own Gmail address
+   as a **test user**.
+3. Go to **Credentials → Create credentials → OAuth client ID** and pick application
+   type **Desktop app**.
+4. Run `agent-mail account add`. It asks for the client ID and secret the first time
+   and saves them in the config file, where all your Gmail accounts share them. You can
+   also pass `--client-id/--client-secret`, or set `AGENT_MAIL_GOOGLE_CLIENT_ID` and
+   `AGENT_MAIL_GOOGLE_CLIENT_SECRET`.
+
+While the app's publishing status is **Testing**, Google expires refresh tokens after
+7 days, so you'd need to run `account login` weekly. To avoid that, click **Publish
+app** on the consent screen page. Google will show an "unverified app" warning when
+you sign in; click through it. You don't need verification for your own use.
+
+### Without a browser
+
+```sh
+# Gmail app password instead of OAuth (needs 2-Step Verification)
+agent-mail account add personal --email you@gmail.com --auth password
+# Scripted: password from stdin or a command
+echo "$PW" | agent-mail account add apple --email you@icloud.com --password-stdin
+agent-mail account add apple --email you@icloud.com --password-command "op read op://Private/icloud/app-pw"
+# Bring your own OAuth token source
+agent-mail account add work --email you@company.com --oauth-token-command "my-token-helper"
+```
+
+Add `--no-browser` to print URLs instead of opening them.
+
+### Where credentials live
+
+- **macOS Keychain**, service `agent-mail`: app passwords and Google refresh tokens.
+  The `AGENT_MAIL_<ACCOUNT>_PASSWORD` environment variable overrides the stored
+  password.
+- **`~/.config/agent-mail/config.toml`** (mode 0600; change the location with
+  `AGENT_MAIL_CONFIG`): account settings and the Google client ID and secret. Google
+  says Desktop-app client secrets aren't actually confidential.
+
+`account remove` deletes the account's keychain entries. Each account can also override
+`host`, `port`, `username`, `drafts_mailbox` and `trash_mailbox` in the config.
 
 ## Usage
 
@@ -126,5 +179,9 @@ cargo test
 The unit tests cover building and parsing messages, the editor format and reply
 threading. The full IMAP flows were checked by hand against a fake server that
 mimics Gmail's expunge-only-archives behavior and iCloud's split FETCH responses and
-lack of UIDPLUS. For that kind of testing only, an account can set
-`insecure_plaintext = true`, which is allowed only for `localhost`.
+lack of UIDPLUS. The browser sign-in was checked the same way, with a fake Google
+token endpoint (`AGENT_MAIL_GOOGLE_AUTH_URL` / `AGENT_MAIL_GOOGLE_TOKEN_URL`) and a
+`BROWSER` script that approves the consent. The web form was driven with `curl`, using
+`AGENT_MAIL_TEST_IMAP_ADDR=127.0.0.1:<port>` to point new accounts at the fake server.
+For that kind of testing only, an account can set `insecure_plaintext = true`, which
+is allowed only for `localhost`.

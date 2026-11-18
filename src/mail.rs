@@ -9,7 +9,7 @@ use imap_proto::{NameAttribute, UidSetMember};
 use serde::Serialize;
 
 use crate::auth;
-use crate::config::{Account, AuthMethod, Provider};
+use crate::config::{Account, AuthMethod, OAuthClient, Provider};
 
 pub type Session = imap::Session<imap::Connection>;
 
@@ -144,8 +144,35 @@ fn summarize(uid: u32, m: &Merged) -> Summary {
     }
 }
 
+/// A resolved secret to log in with.
+pub enum Credential {
+    Password(String),
+    AccessToken(String),
+}
+
 impl Client {
-    pub fn connect(account_name: &str, account: &Account) -> Result<Client> {
+    /// Connect using the account's stored credentials (env, command, keychain, OAuth refresh).
+    pub fn connect(
+        account_name: &str,
+        account: &Account,
+        google: Option<&OAuthClient>,
+    ) -> Result<Client> {
+        let cred = match account.auth {
+            AuthMethod::Password => Credential::Password(auth::password(account_name, account)?),
+            AuthMethod::Oauth2 => {
+                Credential::AccessToken(auth::oauth_token(account_name, account, google)?)
+            }
+        };
+        Self::connect_with(account, cred).map_err(|e| match account.auth {
+            AuthMethod::Oauth2 => {
+                anyhow!("{e:#}\nRun `agent-mail account login {account_name}` to re-authorize.")
+            }
+            AuthMethod::Password => e,
+        })
+    }
+
+    /// Connect with an explicit credential (used to verify before storing anything).
+    pub fn connect_with(account: &Account, cred: Credential) -> Result<Client> {
         let mut builder = imap::ClientBuilder::new(account.host(), account.port());
         if account.insecure_plaintext {
             if !matches!(account.host(), "localhost" | "127.0.0.1" | "::1") {
@@ -156,9 +183,8 @@ impl Client {
         let client = builder
             .connect()
             .with_context(|| format!("connecting to {}:{}", account.host(), account.port()))?;
-        let session = match account.auth {
-            AuthMethod::Password => {
-                let pw = auth::password(account_name, account)?;
+        let session = match cred {
+            Credential::Password(pw) => {
                 client.login(account.username(), pw).map_err(|(e, _)| {
                     anyhow!(
                         "login failed for {}: {e}\n{}",
@@ -167,15 +193,17 @@ impl Client {
                     )
                 })?
             }
-            AuthMethod::Oauth2 => {
-                let token = auth::oauth_token(account)?;
+            Credential::AccessToken(token) => {
                 let a = XOAuth2 {
                     user: account.username().to_string(),
                     token,
                 };
-                client
-                    .authenticate("XOAUTH2", &a)
-                    .map_err(|(e, _)| anyhow!("XOAUTH2 authentication failed: {e}"))?
+                client.authenticate("XOAUTH2", &a).map_err(|(e, _)| {
+                    anyhow!(
+                        "XOAUTH2 authentication failed for {}: {e}",
+                        account.username()
+                    )
+                })?
             }
         };
         Ok(Client {
